@@ -9,23 +9,23 @@ import zipfile
 import albumentations as alb
 from albumentations.pytorch import ToTensorV2
 from sklearn.model_selection import train_test_split
-import segmentation_models_pytorch as smp # <--- 引入强大的分割模型库
+import segmentation_models_pytorch as smp
 
-# 配置参数
+# --- 配置参数 ---
 config = {
     "all_img_dir": "/mnt/workspace/data/images/training",
     "all_mask_dir": "/mnt/workspace/data/annotations/training",
     "test_img_dir": "/mnt/workspace/data/images/test",
     "model_save_path":"/mnt/workspace/data/best_model.pth",
     "batch_size": 4,
-    "num_epochs": 20,             # <--- 增加训练轮数，给模型充分学习时间
+    "num_epochs": 100,             # <--- MODIFICATION: 给予充足的训练时间
     "learning_rate": 0.001,
-    "img_size": (256, 256),        # <--- 使用对模型更友好的尺寸
+    "img_size": (256, 256),
     "num_classes": 4,
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu")
 }
 
-# --- 数据集定义 (无需修改) ---
+# --- 数据集定义 ---
 class SteelDataset(Dataset):
     def __init__(self, img_dir, mask_dir, img_names, transform=None):
         self.img_dir = img_dir
@@ -54,7 +54,7 @@ class SteelDataset(Dataset):
         
         return image, mask
 
-# --- Dice Loss 定义 (解决类别不平衡的关键) ---
+# --- Dice Loss 定义 ---
 class DiceLoss(nn.Module):
     def __init__(self, n_classes):
         super(DiceLoss, self).__init__()
@@ -92,9 +92,8 @@ class DiceLoss(nn.Module):
             loss += dice * weight[i]
         return loss / self.n_classes
 
-# --- 训练函数 (重大修改) ---
+# --- 训练函数 ---
 def train_model(train_loader, val_loader):
-    # <--- MODIFICATION: 使用预训练的ResNet34作为骨干的U-Net
     model = smp.Unet(
         encoder_name="resnet34",
         encoder_weights="imagenet",
@@ -103,7 +102,6 @@ def train_model(train_loader, val_loader):
     )
     model.to(config["device"])
     
-    # <--- MODIFICATION: 定义组合损失函数
     criterion_ce = nn.CrossEntropyLoss()
     criterion_dice = DiceLoss(n_classes=config["num_classes"])
     
@@ -112,7 +110,7 @@ def train_model(train_loader, val_loader):
 
     best_val_loss = float('inf')
     epochs_no_improve = 0
-    patience = 15 # <--- 增加早停的耐心
+    patience = 15 # <--- MODIFICATION: 更有耐心地等待模型收敛
 
     for epoch in range(config["num_epochs"]):
         # --- 训练阶段 ---
@@ -125,7 +123,6 @@ def train_model(train_loader, val_loader):
             optimizer.zero_grad()
             outputs = model(images)
             
-            # 计算组合损失
             loss_ce = criterion_ce(outputs, masks)
             loss_dice = criterion_dice(outputs, masks)
             loss = 0.5 * loss_ce + 0.5 * loss_dice
@@ -174,10 +171,9 @@ def train_model(train_loader, val_loader):
 
 # --- 预测函数 ---
 def predict_and_save():
-    # <--- MODIFICATION: 实例化时也必须使用和训练时完全一样的模型结构
     model = smp.Unet(
         encoder_name="resnet34",
-        encoder_weights=None, # 预测时不需要加载预训练权重，我们会加载自己训练好的
+        encoder_weights=None,
         in_channels=3,
         classes=config["num_classes"],
     )
@@ -225,7 +221,6 @@ if __name__ == "__main__":
     all_img_names = os.listdir(config["all_img_dir"])
     train_names, val_names = train_test_split(all_img_names, test_size=0.2, random_state=42)
 
-    # 定义训练和验证的数据增强
     train_transform = alb.Compose([
         alb.Resize(*config["img_size"]),
         alb.HorizontalFlip(p=0.5),
@@ -243,15 +238,12 @@ if __name__ == "__main__":
         ToTensorV2()
     ])
 
-    # 创建数据集和加载器
     train_dataset = SteelDataset(config["all_img_dir"], config["all_mask_dir"], train_names, transform=train_transform)
     val_dataset = SteelDataset(config["all_img_dir"], config["all_mask_dir"], val_names, transform=val_transform)
 
     train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False)
     
-    # 训练模型
     train_model(train_loader, val_loader)
 
-    # 进行预测并保存结果
     predict_and_save()
