@@ -5,30 +5,28 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
 import zipfile
 import albumentations as alb
-from albumentations.pytorch import ToTensorV2 # <--- MODIFICATION
-from sklearn.model_selection import train_test_split # <--- MODIFICATION
-import collections
+from albumentations.pytorch import ToTensorV2
+from sklearn.model_selection import train_test_split
+import segmentation_models_pytorch as smp # <--- 引入强大的分割模型库
 
 # 配置参数
 config = {
     "all_img_dir": "/mnt/workspace/data/images/training",
     "all_mask_dir": "/mnt/workspace/data/annotations/training",
     "test_img_dir": "/mnt/workspace/data/images/test",
-    "model_save_path":"/mnt/workspace/data/best_model.pth", # <--- MODIFICATION: 保存最佳模型
+    "model_save_path":"/mnt/workspace/data/best_model.pth",
     "batch_size": 4,
-    "num_epochs": 30, # <--- MODIFICATION: 增加训练轮数
+    "num_epochs": 20,             # <--- 增加训练轮数，给模型充分学习时间
     "learning_rate": 0.001,
-    "img_size": (256, 256), # <--- MODIFICATION: 增加图像尺寸
+    "img_size": (256, 256),        # <--- 使用对模型更友好的尺寸
     "num_classes": 4,
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu")
 }
 
-# 数据集定义
+# --- 数据集定义 (无需修改) ---
 class SteelDataset(Dataset):
-    # <--- MODIFICATION: 接收文件名列表而不是目录
     def __init__(self, img_dir, mask_dir, img_names, transform=None):
         self.img_dir = img_dir
         self.mask_dir = mask_dir
@@ -44,74 +42,77 @@ class SteelDataset(Dataset):
         
         mask_name = os.path.splitext(self.img_names[idx])[0] + ".png"
         mask_path = os.path.join(self.mask_dir, mask_name)
-        if not os.path.exists(mask_path):
-            raise FileNotFoundError(f"Mask file {mask_path} not found!")
         mask = Image.open(mask_path).convert("L")
 
         image = np.array(image)
         mask = np.array(mask)
-        mask = mask.astype(np.int64)
 
         if self.transform:
             augmented = self.transform(image=image, mask=mask)
             image = augmented["image"]
             mask = augmented["mask"]
         
-        # <--- MODIFICATION: ToTensorV2 会处理通道和类型，不需要手动转换
         return image, mask
 
-# U-Net模型定义 (无需修改)
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-    def forward(self, x):
-        return self.double_conv(x)
+# --- Dice Loss 定义 (解决类别不平衡的关键) ---
+class DiceLoss(nn.Module):
+    def __init__(self, n_classes):
+        super(DiceLoss, self).__init__()
+        self.n_classes = n_classes
 
-class UNet(nn.Module):
-    def __init__(self, n_channels=3, n_classes=4):
-        super(UNet, self).__init__()
-        self.down1 = DoubleConv(n_channels, 64)
-        self.down2 = DoubleConv(64, 128)
-        self.down3 = DoubleConv(128, 256)
-        self.down4 = DoubleConv(256, 512)
-        self.pool = nn.MaxPool2d(2)
-        self.up1 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
-        self.conv1 = DoubleConv(512, 256)
-        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.conv2 = DoubleConv(256, 128)
-        self.up3 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.conv3 = DoubleConv(128, 64)
-        self.out_conv = nn.Conv2d(64, n_classes, kernel_size=1)
-    def forward(self, x):
-        x1 = self.down1(x); x2 = self.pool(x1); x2 = self.down2(x2)
-        x3 = self.pool(x2); x3 = self.down3(x3); x4 = self.pool(x3)
-        x4 = self.down4(x4); x = self.up1(x4); x = torch.cat([x, x3], dim=1)
-        x = self.conv1(x); x = self.up2(x); x = torch.cat([x, x2], dim=1)
-        x = self.conv2(x); x = self.up3(x); x = torch.cat([x, x1], dim=1)
-        x = self.conv3(x); logits = self.out_conv(x)
-        return logits
+    def _one_hot_encoder(self, input_tensor):
+        tensor_list = []
+        for i in range(self.n_classes):
+            temp_prob = input_tensor == i
+            tensor_list.append(temp_prob.unsqueeze(1))
+        return torch.cat(tensor_list, dim=1)
+
+    def _dice_loss(self, score, target):
+        target = target.float()
+        smooth = 1e-5
+        intersect = torch.sum(score * target)
+        y_sum = torch.sum(target * target)
+        z_sum = torch.sum(score * score)
+        loss = (2 * intersect + smooth) / (z_sum + y_sum + smooth)
+        loss = 1 - loss
+        return loss
+
+    def forward(self, inputs, target, weight=None, softmax=True):
+        if softmax:
+            inputs = torch.softmax(inputs, dim=1)
+        target = self._one_hot_encoder(target)
+        if weight is None:
+            weight = [1] * self.n_classes
         
-# 训练函数 (重大修改)
-# 训练函数 (已修复数据类型问题)
+        assert inputs.size() == target.size(), 'predict & target shape do not match'
+        
+        loss = 0.0
+        for i in range(0, self.n_classes):
+            dice = self._dice_loss(inputs[:, i], target[:, i])
+            loss += dice * weight[i]
+        return loss / self.n_classes
+
+# --- 训练函数 (重大修改) ---
 def train_model(train_loader, val_loader):
-    model = UNet(n_channels=3, n_classes=config["num_classes"])
+    # <--- MODIFICATION: 使用预训练的ResNet34作为骨干的U-Net
+    model = smp.Unet(
+        encoder_name="resnet34",
+        encoder_weights="imagenet",
+        in_channels=3,
+        classes=config["num_classes"],
+    )
     model.to(config["device"])
     
-    criterion = nn.CrossEntropyLoss()
+    # <--- MODIFICATION: 定义组合损失函数
+    criterion_ce = nn.CrossEntropyLoss()
+    criterion_dice = DiceLoss(n_classes=config["num_classes"])
+    
     optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.1, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=8, factor=0.1, verbose=True)
 
     best_val_loss = float('inf')
     epochs_no_improve = 0
-    patience = 10 
+    patience = 15 # <--- 增加早停的耐心
 
     for epoch in range(config["num_epochs"]):
         # --- 训练阶段 ---
@@ -119,12 +120,16 @@ def train_model(train_loader, val_loader):
         running_loss = 0.0
         for images, masks in train_loader:
             images = images.to(config["device"])
-            # <--- MODIFICATION: 修正数据类型
             masks = masks.to(config["device"], dtype=torch.long) 
 
             optimizer.zero_grad()
             outputs = model(images)
-            loss = criterion(outputs, masks)
+            
+            # 计算组合损失
+            loss_ce = criterion_ce(outputs, masks)
+            loss_dice = criterion_dice(outputs, masks)
+            loss = 0.5 * loss_ce + 0.5 * loss_dice
+            
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
@@ -137,11 +142,13 @@ def train_model(train_loader, val_loader):
         with torch.no_grad():
             for images, masks in val_loader:
                 images = images.to(config["device"])
-                # <--- MODIFICATION: 修正数据类型
                 masks = masks.to(config["device"], dtype=torch.long)
-
                 outputs = model(images)
-                loss = criterion(outputs, masks)
+                
+                loss_ce = criterion_ce(outputs, masks)
+                loss_dice = criterion_dice(outputs, masks)
+                loss = 0.5 * loss_ce + 0.5 * loss_dice
+                
                 val_loss += loss.item()
 
         val_loss /= len(val_loader)
@@ -164,11 +171,19 @@ def train_model(train_loader, val_loader):
 
     print("Training completed.")
 
-# 预测函数 (基本不变，但加载模型路径需要注意)
+
+# --- 预测函数 ---
 def predict_and_save():
-    model = UNet(n_channels=3, n_classes=config["num_classes"])
+    # <--- MODIFICATION: 实例化时也必须使用和训练时完全一样的模型结构
+    model = smp.Unet(
+        encoder_name="resnet34",
+        encoder_weights=None, # 预测时不需要加载预训练权重，我们会加载自己训练好的
+        in_channels=3,
+        classes=config["num_classes"],
+    )
+    
     if not os.path.exists(config["model_save_path"]):
-        raise FileNotFoundError(f"Model file {config['model_save_path']} not found! Please train the model first.")
+        raise FileNotFoundError(f"Model file {config['model_save_path']} not found!")
         
     model.load_state_dict(torch.load(config["model_save_path"], map_location=config["device"]))
     model.to(config["device"])
@@ -176,7 +191,6 @@ def predict_and_save():
 
     test_images = os.listdir(config["test_img_dir"])
     
-    # <--- MODIFICATION: 预测时也需要归一化
     transform = alb.Compose([
         alb.Resize(*config["img_size"]),
         alb.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
@@ -195,9 +209,6 @@ def predict_and_save():
             output = model(image_tensor)
             pred = torch.argmax(output, dim=1).squeeze().cpu().numpy()
             
-            # 这里需要注意，预测出的mask大小是config["img_size"]，如果提交要求原图尺寸，需要缩放回去
-            # pred_resized = cv2.resize(pred, (original_width, original_height), interpolation=cv2.INTER_NEAREST)
-            
             np.save(f"result/{os.path.splitext(img_name)[0]}.npy", pred.astype(np.uint8))
 
     with zipfile.ZipFile("result.zip", "w") as zipf:
@@ -207,15 +218,14 @@ def predict_and_save():
     print("Prediction results saved to result.zip")
 
 
-# 主程序
+# --- 主程序 ---
 if __name__ == "__main__":
     os.makedirs("result", exist_ok=True)
     
-    # <--- MODIFICATION: 数据准备
     all_img_names = os.listdir(config["all_img_dir"])
     train_names, val_names = train_test_split(all_img_names, test_size=0.2, random_state=42)
 
-    # <--- MODIFICATION: 定义训练和验证的数据增强
+    # 定义训练和验证的数据增强
     train_transform = alb.Compose([
         alb.Resize(*config["img_size"]),
         alb.HorizontalFlip(p=0.5),
@@ -233,7 +243,7 @@ if __name__ == "__main__":
         ToTensorV2()
     ])
 
-    # <--- MODIFICATION: 创建数据集和加载器
+    # 创建数据集和加载器
     train_dataset = SteelDataset(config["all_img_dir"], config["all_mask_dir"], train_names, transform=train_transform)
     val_dataset = SteelDataset(config["all_img_dir"], config["all_mask_dir"], val_names, transform=val_transform)
 
