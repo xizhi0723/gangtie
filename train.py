@@ -10,34 +10,39 @@ import albumentations as alb
 from albumentations.pytorch import ToTensorV2
 from sklearn.model_selection import train_test_split
 import segmentation_models_pytorch as smp
-import cv2 # 引入OpenCV
 
-# --- 配置参数 (回归到279.06分的黄金配置) ---
+# --- 最终冲刺配置 ---
 config = {
     "all_img_dir": "/mnt/workspace/data/images/training",
     "all_mask_dir": "/mnt/workspace/data/annotations/training",
     "test_img_dir": "/mnt/workspace/data/images/test",
     "model_save_path":"/mnt/workspace/data/best_model.pth",
-    "batch_size": 4,               # <--- 回归到 batch_size=4
-    "num_epochs": 100,
+    "batch_size": 4,
+    "num_epochs": 150,
     "learning_rate": 1e-4,
-    "img_size": (256, 256),        # <--- 回归到 img_size=256
+    "img_size": (256, 256),
     "num_classes": 4,
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu")
 }
 
-# --- 数据集与Dice Loss定义 (无变化) ---
+# --- 数据集定义 ---
 class SteelDataset(Dataset):
-    def __init__(self, img_dir, mask_dir, img_names, transform=None): self.img_dir = img_dir; self.mask_dir = mask_dir; self.transform = transform; self.img_names = img_names
-    def __len__(self): return len(self.img_names)
+    def __init__(self, img_dir, mask_dir, img_names, transform=None):
+        self.img_dir = img_dir; self.mask_dir = mask_dir; self.transform = transform; self.img_names = img_names
+    def __len__(self):
+        return len(self.img_names)
     def __getitem__(self, idx):
         img_path = os.path.join(self.img_dir, self.img_names[idx]); image = Image.open(img_path).convert("RGB")
         mask_name = os.path.splitext(self.img_names[idx])[0] + ".png"; mask_path = os.path.join(self.mask_dir, mask_name); mask = Image.open(mask_path).convert("L")
         image = np.array(image); mask = np.array(mask)
-        if self.transform: augmented = self.transform(image=image, mask=mask); image = augmented["image"]; mask = augmented["mask"]
+        if self.transform:
+            augmented = self.transform(image=image, mask=mask); image = augmented["image"]; mask = augmented["mask"]
         return image, mask
+
+# --- Dice Loss 定义 ---
 class DiceLoss(nn.Module):
-    def __init__(self, n_classes): super(DiceLoss, self).__init__(); self.n_classes = n_classes
+    def __init__(self, n_classes):
+        super(DiceLoss, self).__init__(); self.n_classes = n_classes
     def _one_hot_encoder(self, input_tensor):
         tensor_list = [];
         for i in range(self.n_classes): temp_prob = input_tensor == i; tensor_list.append(temp_prob.unsqueeze(1))
@@ -54,14 +59,15 @@ class DiceLoss(nn.Module):
         for i in range(0, self.n_classes): dice = self._dice_loss(inputs[:, i], target[:, i]); loss += dice * weight[i]
         return loss / self.n_classes
 
-# --- 训练函数 (与279.06分版本完全相同) ---
+# --- 训练函数 ---
 def train_model(train_loader, val_loader):
     model = smp.Unet(encoder_name="resnet34", encoder_weights="imagenet", in_channels=3, classes=config["num_classes"])
     model.to(config["device"])
     criterion_ce = nn.CrossEntropyLoss(); criterion_dice = DiceLoss(n_classes=config["num_classes"])
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["num_epochs"], eta_min=1e-6)
-    best_val_loss = float('inf'); epochs_no_improve = 0; patience = 15
+    best_val_loss = float('inf'); epochs_no_improve = 0
+    patience = 20
     for epoch in range(config["num_epochs"]):
         model.train(); running_loss = 0.0
         for images, masks in train_loader:
@@ -87,10 +93,10 @@ def train_model(train_loader, val_loader):
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
-            if epochs_no_improve >= patience: print(f"Early stopping."); break
+            if epochs_no_improve >= patience: print(f"No improvement in validation loss for {patience} epochs. Early stopping."); break
     print("Training completed.")
 
-# --- 预测函数 (集成后处理) ---
+# --- 预测函数 ---
 def predict_and_save():
     model = smp.Unet(encoder_name="resnet34", encoder_weights=None, in_channels=3, classes=config["num_classes"])
     model.load_state_dict(torch.load(config["model_save_path"], map_location=config["device"]))
@@ -110,23 +116,16 @@ def predict_and_save():
                 predictions.append(torch.softmax(output, dim=1))
             final_output = torch.mean(torch.stack(predictions, dim=0), dim=0)
             pred_mask = torch.argmax(final_output, dim=1).squeeze().cpu().numpy().astype(np.uint8)
-            
-            # <--- 唯一的新变量：后处理 ---
-            for class_id in range(1, config["num_classes"]):
-                class_mask = (pred_mask == class_id).astype(np.uint8)
-                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(class_mask, 4, cv2.CV_32S)
-                for i in range(1, num_labels):
-                    if stats[i, cv2.CC_STAT_AREA] < 20: # 面积阈值，可以微调
-                        pred_mask[labels == i] = 0
-            
             np.save(f"result/{os.path.splitext(img_name)[0]}.npy", pred_mask)
 
     with zipfile.ZipFile("result.zip", "w") as zipf:
+        # <--- 这里是修正的地方 ---
         for file in os.listdir("result"):
-            if file.endswith(".npy"): zipf.write(os.path.join("result", file), file)
-    print("Prediction with Post-Processing results saved to result.zip")
+            if file.endswith(".npy"):
+                zipf.write(os.path.join("result", file), file)
+    print("Prediction results saved to result.zip")
 
-# --- 主程序 (无变化) ---
+# --- 主程序 ---
 if __name__ == "__main__":
     os.makedirs("result", exist_ok=True)
     all_img_names = os.listdir(config["all_img_dir"])
