@@ -10,18 +10,18 @@ import albumentations as alb
 from albumentations.pytorch import ToTensorV2
 from sklearn.model_selection import train_test_split
 import segmentation_models_pytorch as smp
-import cv2 # <--- 引入OpenCV用于后处理
+import cv2 # 引入OpenCV
 
-# --- 配置参数 ---
+# --- 配置参数 (回归到279.06分的黄金配置) ---
 config = {
     "all_img_dir": "/mnt/workspace/data/images/training",
     "all_mask_dir": "/mnt/workspace/data/annotations/training",
     "test_img_dir": "/mnt/workspace/data/images/test",
     "model_save_path":"/mnt/workspace/data/best_model.pth",
-    "batch_size": 2,               # <--- 物理批大小，因为图像尺寸增大
+    "batch_size": 4,               # <--- 回归到 batch_size=4
     "num_epochs": 100,
     "learning_rate": 1e-4,
-    "img_size": (320, 320),        # <--- NEW: 增大图像尺寸
+    "img_size": (256, 256),        # <--- 回归到 img_size=256
     "num_classes": 4,
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu")
 }
@@ -54,30 +54,23 @@ class DiceLoss(nn.Module):
         for i in range(0, self.n_classes): dice = self._dice_loss(inputs[:, i], target[:, i]); loss += dice * weight[i]
         return loss / self.n_classes
 
-# --- 训练函数 (集成梯度累积) ---
+# --- 训练函数 (与279.06分版本完全相同) ---
 def train_model(train_loader, val_loader):
     model = smp.Unet(encoder_name="resnet34", encoder_weights="imagenet", in_channels=3, classes=config["num_classes"])
     model.to(config["device"])
     criterion_ce = nn.CrossEntropyLoss(); criterion_dice = DiceLoss(n_classes=config["num_classes"])
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["num_epochs"], eta_min=1e-6)
-    
-    # <--- NEW: 再次引入梯度累积以支持大尺寸图像 ---
-    accumulation_steps = 2 # 虚拟批大小 = 2 * 2 = 4
-    
     best_val_loss = float('inf'); epochs_no_improve = 0; patience = 15
     for epoch in range(config["num_epochs"]):
-        model.train(); running_loss = 0.0; optimizer.zero_grad()
-        for i, (images, masks) in enumerate(train_loader):
+        model.train(); running_loss = 0.0
+        for images, masks in train_loader:
             images = images.to(config["device"]); masks = masks.to(config["device"], dtype=torch.long)
-            outputs = model(images)
-            loss_ce = criterion_ce(outputs, masks); loss_dice = criterion_dice(outputs, masks)
+            optimizer.zero_grad()
+            outputs = model(images); loss_ce = criterion_ce(outputs, masks); loss_dice = criterion_dice(outputs, masks)
             loss = 0.2 * loss_ce + 0.8 * loss_dice
-            loss = loss / accumulation_steps
-            loss.backward()
-            running_loss += loss.item() * accumulation_steps
-            if (i + 1) % accumulation_steps == 0:
-                optimizer.step(); optimizer.zero_grad()
+            loss.backward(); optimizer.step()
+            running_loss += loss.item()
         scheduler.step()
         model.eval(); val_loss = 0.0
         with torch.no_grad():
@@ -86,7 +79,7 @@ def train_model(train_loader, val_loader):
                 outputs = model(images); loss_ce = criterion_ce(outputs, masks); loss_dice = criterion_dice(outputs, masks)
                 loss = 0.2 * loss_ce + 0.8 * loss_dice; val_loss += loss.item()
         val_loss /= len(val_loader)
-        train_loss_epoch = running_loss / len(train_loader.dataset) * config["batch_size"]
+        train_loss_epoch = running_loss / len(train_loader)
         print(f"Epoch {epoch + 1}/{config['num_epochs']}, Train Loss: {train_loss_epoch:.4f}, Val Loss: {val_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
         if val_loss < best_val_loss:
             best_val_loss = val_loss; os.makedirs(os.path.dirname(config["model_save_path"]), exist_ok=True)
@@ -118,20 +111,13 @@ def predict_and_save():
             final_output = torch.mean(torch.stack(predictions, dim=0), dim=0)
             pred_mask = torch.argmax(final_output, dim=1).squeeze().cpu().numpy().astype(np.uint8)
             
-            # <--- NEW: 后处理，移除小噪点 ---
-            # 遍历每个缺陷类别（从1到3，因为0是背景）
+            # <--- 唯一的新变量：后处理 ---
             for class_id in range(1, config["num_classes"]):
-                # 创建一个只包含当前类别像素的二值图
                 class_mask = (pred_mask == class_id).astype(np.uint8)
-                
-                # 连通域分析
                 num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(class_mask, 4, cv2.CV_32S)
-                
-                # 遍历除背景外的所有连通域
                 for i in range(1, num_labels):
-                    # 如果连通域的面积小于阈值（例如20像素），则在原始预测图中将其移除
-                    if stats[i, cv2.CC_STAT_AREA] < 20:
-                        pred_mask[labels == i] = 0 # 归为背景
+                    if stats[i, cv2.CC_STAT_AREA] < 20: # 面积阈值，可以微调
+                        pred_mask[labels == i] = 0
             
             np.save(f"result/{os.path.splitext(img_name)[0]}.npy", pred_mask)
 
@@ -151,5 +137,6 @@ if __name__ == "__main__":
     val_dataset = SteelDataset(config["all_img_dir"], config["all_mask_dir"], val_names, transform=val_transform)
     train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False)
+    
     train_model(train_loader, val_loader)
     predict_and_save()
