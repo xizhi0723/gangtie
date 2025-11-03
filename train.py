@@ -17,7 +17,7 @@ config = {
     "all_mask_dir": "/mnt/workspace/data/annotations/training",
     "test_img_dir": "/mnt/workspace/data/images/test",
     "model_save_path":"/mnt/workspace/data/best_model.pth",
-    "batch_size": 2,               # 模型变大，降低batch_size以防爆显存
+    "batch_size": 2,               # 物理批大小，受限于显存
     "num_epochs": 100,
     "learning_rate": 1e-4,
     "img_size": (256, 256),
@@ -91,9 +91,8 @@ class DiceLoss(nn.Module):
             loss += dice * weight[i]
         return loss / self.n_classes
 
-# --- 训练函数 ---
+# --- 训练函数 (集成梯度累积) ---
 def train_model(train_loader, val_loader):
-    # 使用更强大的 EfficientNet-B4 模型
     model = smp.Unet(
         encoder_name="efficientnet-b4",
         encoder_weights="imagenet",
@@ -107,6 +106,9 @@ def train_model(train_loader, val_loader):
     optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"])
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=8, factor=0.1, verbose=True)
     
+    # 梯度累积设置
+    accumulation_steps = 4  # 累积4步，虚拟批大小 = 2 * 4 = 8
+    
     best_val_loss = float('inf')
     epochs_no_improve = 0
     patience = 15
@@ -114,23 +116,34 @@ def train_model(train_loader, val_loader):
     for epoch in range(config["num_epochs"]):
         model.train()
         running_loss = 0.0
-        for images, masks in train_loader:
+        optimizer.zero_grad() # 在每个epoch开始时清零一次梯度
+
+        for i, (images, masks) in enumerate(train_loader):
             images = images.to(config["device"])
             masks = masks.to(config["device"], dtype=torch.long)
             
-            optimizer.zero_grad()
+            # 前向传播
             outputs = model(images)
             
+            # 计算损失
             loss_ce = criterion_ce(outputs, masks)
             loss_dice = criterion_dice(outputs, masks)
             loss = 0.2 * loss_ce + 0.8 * loss_dice
             
+            # 归一化损失并进行反向传播
+            # 必须要把损失除以累积的步数，以保持每个样本的梯度贡献是相同的
+            loss = loss / accumulation_steps
             loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
             
-        train_loss = running_loss / len(train_loader)
+            # 记录真实的损失值（累加前）
+            running_loss += loss.item() * accumulation_steps
 
+            # 累积了足够步数后，更新权重，并清零梯度
+            if (i + 1) % accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+        
+        # --- 验证阶段 (无变化) ---
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -144,7 +157,10 @@ def train_model(train_loader, val_loader):
                 val_loss += loss.item()
                 
         val_loss /= len(val_loader)
-        print(f"Epoch {epoch + 1}/{config['num_epochs']}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        
+        # 由于更新频率不同，这里的训练损失只是一个近似值
+        approx_train_loss = running_loss / len(train_loader.dataset) * config["batch_size"]
+        print(f"Epoch {epoch + 1}/{config['num_epochs']}, Approx Train Loss: {approx_train_loss:.4f}, Val Loss: {val_loss:.4f}")
         
         scheduler.step(val_loss)
         
@@ -162,9 +178,8 @@ def train_model(train_loader, val_loader):
                 
     print("Training completed.")
 
-# --- 预测函数 (with Enhanced TTA) ---
+# --- 预测函数 (使用增强版TTA) ---
 def predict_and_save():
-    # 实例化时也必须使用和训练时完全一样的模型结构
     model = smp.Unet(
         encoder_name="efficientnet-b4",
         encoder_weights=None,
@@ -186,7 +201,7 @@ def predict_and_save():
         for img_name in test_images:
             img_path = os.path.join(config["test_img_dir"], img_name)
             image = np.array(Image.open(img_path).convert("RGB"))
-
+            
             # 增强版 TTA
             images_to_predict = [
                 image,
